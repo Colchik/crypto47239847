@@ -1,0 +1,18 @@
+trading:
+  symbols: 
+    - ETHUSDT
+  timeframe: 15m
+  risk_usd: 100
+  commission: 0.001
+  spread: 0.0001
+  historical_days: 260
+  update_interval_sec: 60
+
+binance:
+  api_key: "KkCEDYoKxeks1luwTX2qGw11BZWTBwieKPNgLdiLuC6LVjYKirfIDzgawkPho30s"
+  api_secret: "KMOZXq8XS3vKWWSisywOq2oBf6L5A38aUFWkuB77wn6boknqO11zBjgSA7WK1ch4"
+  testnet: true
+
+telegram:
+  token: "7845225008:AAG86ydZRTucCHIYtrksBwq46O-FDazF5-8"
+  chat_id: "6747158875"
