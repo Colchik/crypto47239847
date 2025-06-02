@@ -9,10 +9,10 @@ trading:
   update_interval_sec: 60
 
 binance:
-  api_key: "KkCEDYoKxeks1luwTX2qGw11BZWTBwieKPNgLdiLuC6LVjYKirfIDzgawkPho30s"
-  api_secret: "KMOZXq8XS3vKWWSisywOq2oBf6L5A38aUFWkuB77wn6boknqO11zBjgSA7WK1ch4"
+  api_key: ""
+  api_secret: ""
   testnet: true
 
 telegram:
-  token: "7845225008:AAG86ydZRTucCHIYtrksBwq46O-FDazF5-8"
-  chat_id: "6747158875"
+  token: ""
+  chat_id: ""
