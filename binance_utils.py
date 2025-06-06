@@ -246,12 +246,34 @@ def place_take_profit_order(client: Client, symbol: str, side: str, quantity: fl
         return None
 
 def cancel_order(client: Client, symbol: str, order_id: str) -> bool:
-    """Отмена ордера"""
+    """Отмена ордера с проверкой существования"""
     try:
+        # Сначала проверяем, существует ли ордер
+        try:
+            order_status = client.get_order(symbol=symbol, orderId=order_id)
+            if order_status['status'] in ['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED']:
+                logger.info(f"Ордер {order_id} для {symbol} уже в статусе {order_status['status']}, отмена не требуется")
+                return True
+        except BinanceAPIException as e:
+            if e.code == -2013:  # Order does not exist
+                logger.info(f"Ордер {order_id} для {symbol} не существует, отмена не требуется")
+                return True
+            # Другие ошибки проверки пропускаем и пытаемся отменить ордер
+        
+        # Отменяем ордер
         client.cancel_order(symbol=symbol, orderId=order_id)
         logger.info(f"Отменен ордер {order_id} для {symbol}")
         return True
+        
     except BinanceAPIException as e:
+        # Если ордер не найден - это не ошибка, он уже отменен или исполнен
+        if e.code == -2011:  # Unknown order
+            logger.info(f"Ордер {order_id} для {symbol} уже отменен или исполнен")
+            return True
+        else:
+            logger.error(f"Ошибка отмены ордера: {e}")
+            return False
+    except Exception as e:
         logger.error(f"Ошибка отмены ордера: {e}")
         return False
 

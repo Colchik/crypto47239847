@@ -428,10 +428,7 @@ class EnhancedPositionManager:
 
     async def place_sl_tp_orders(self, position: Position):
         try:
-            # Определяем сторону для закрытия позиции
-            close_side = "SELL" if position.side == "LONG" else "BUY"
-            
-            # Отменяем существующие ордера, если есть
+            # Отмена существующих ордеров, если есть
             if position.symbol in self.stop_loss_orders:
                 cancel_order(self.client, position.symbol, self.stop_loss_orders[position.symbol])
                 del self.stop_loss_orders[position.symbol]
@@ -440,32 +437,52 @@ class EnhancedPositionManager:
                 cancel_order(self.client, position.symbol, self.take_profit_orders[position.symbol])
                 del self.take_profit_orders[position.symbol]
             
-            # Размещаем OCO ордер вместо отдельных SL и TP
-            oco_order = place_oco_order(
-                self.client,
-                position.symbol,
-                close_side,
-                position.quantity,
-                position.take_profit,  # Take profit цена
-                position.stop_loss,    # Stop loss цена
-            )
+            # Пробуем сначала разместить OCO ордер
+            close_side = "SELL" if position.side == "LONG" else "BUY"
+            try:
+                oco_order = place_oco_order(
+                    self.client,
+                    position.symbol,
+                    close_side,
+                    position.quantity,
+                    position.take_profit,
+                    position.stop_loss
+                )
+                
+                if oco_order:
+                    # Сохраняем ID ордеров
+                    orders = oco_order.get('orderReports', [])
+                    for order in orders:
+                        if order.get('type') == 'STOP_LOSS_LIMIT':
+                            self.stop_loss_orders[position.symbol] = order.get('orderId')
+                        elif order.get('type') == 'LIMIT_MAKER':
+                            self.take_profit_orders[position.symbol] = order.get('orderId')
+                    
+                    logger.info(f"Размещен OCO ордер для {position.symbol}: SL={position.stop_loss}, TP={position.take_profit}")
+                    return
+            except BinanceAPIException as e:
+                logger.warning(f"Не удалось разместить OCO ордер для {position.symbol}: {e}. Будут размещены отдельные ордера.")
             
-            if oco_order:
-                # Сохраняем ID ордера - у OCO ордера может быть несколько ID
-                orders = oco_order.get('orderReports', [])
-                for order in orders:
-                    order_type = order.get('type')
-                    if order_type == 'STOP_LOSS_LIMIT':
-                        self.stop_loss_orders[position.symbol] = order.get('orderId')
-                    elif order_type == 'LIMIT_MAKER':
-                        self.take_profit_orders[position.symbol] = order.get('orderId')
+            # Если OCO не удалось, размещаем отдельные ордера
+            sl_side = "SELL" if position.side == "LONG" else "BUY"
+            sl_order = place_stop_loss_order(
+                self.client, position.symbol, sl_side,
+                position.quantity, position.stop_loss
+            )
+            if sl_order:
+                self.stop_loss_orders[position.symbol] = sl_order.get('orderId')
                 
-                logger.info(f"Размещен OCO ордер для {position.symbol}: TP={position.take_profit}, SL={position.stop_loss}")
-            else:
-                logger.error(f"Не удалось разместить OCO ордер для {position.symbol}")
+            tp_side = "SELL" if position.side == "LONG" else "BUY"
+            tp_order = place_take_profit_order(
+                self.client, position.symbol, tp_side,
+                position.quantity, position.take_profit
+            )
+            if tp_order:
+                self.take_profit_orders[position.symbol] = tp_order.get('orderId')
                 
+            logger.info(f"Размещены отдельные SL/TP ордера для {position.symbol}")
         except Exception as e:
-            logger.error(f"Ошибка размещения OCO ордеров: {e}")
+            logger.error(f"Ошибка размещения SL/TP ордеров: {e}")
             logger.error(traceback.format_exc())
 
     async def close_position(self, symbol: str, exit_price: float, reason: str):
@@ -479,7 +496,7 @@ class EnhancedPositionManager:
                 return
             position._closing = True
             balance_before = get_usdt_balance(self.client)
-            logger.info(f"Баланс ДО закрытия {symbol}: {balance_before:.2f} USDT")
+            logger.warning(f"💰 Баланс ДО закрытия {symbol}: {balance_before:.2f} USDT")
             if symbol in self.stop_loss_orders:
                 cancel_order(self.client, symbol, self.stop_loss_orders[symbol])
                 del self.stop_loss_orders[symbol]
@@ -596,30 +613,36 @@ class EnhancedPositionManager:
                     
                 # Проверка существования позиции на бирже
                 # Если позиция уже закрылась через OCO ордер, нужно обновить локальное состояние
+                # В начале метода update_trailing_stops добавьте проверку статуса ордеров
+                # Это предотвратит попытки манипулировать несуществующими ордерами
+
+                # Перед работой с ордерами
                 try:
-                    # Получаем открытые ордера для символа
+                    # Проверяем статус ордеров
                     open_orders = self.client.get_open_orders(symbol=symbol)
                     
-                    # Если у нас есть ордера в стоп-списке или тейк-профит списке, но их нет на бирже,
-                    # и при этом мы не видим новых транзакций - вероятно, ордер сработал
-                    sl_order_id = self.stop_loss_orders.get(symbol)
-                    tp_order_id = self.take_profit_orders.get(symbol)
+                    # Получаем ID существующих ордеров
+                    existing_order_ids = [order['orderId'] for order in open_orders]
                     
-                    if (sl_order_id or tp_order_id) and not any(o.get('orderId') == sl_order_id or o.get('orderId') == tp_order_id for o in open_orders):
-                        # Проверим, изменился ли баланс - признак того, что ордер исполнился
-                        balance_now = get_usdt_balance(self.client)
-                        # Простая проверка - если баланс изменился, вероятно позиция закрылась
-                        if balance_now != getattr(self, '_last_balance', None):
-                            logger.info(f"Обнаружено автоматическое закрытие позиции {symbol} через OCO ордер")
-                            # Обновляем локальное состояние
-                            self._last_balance = balance_now
-                            if symbol in self.positions:
-                                del self.positions[symbol]
-                            if symbol in self.stop_loss_orders:
-                                del self.stop_loss_orders[symbol]
-                            if symbol in self.take_profit_orders:
-                                del self.take_profit_orders[symbol]
-                            continue
+                    # Проверяем, существуют ли наши ордера
+                    if symbol in self.stop_loss_orders and self.stop_loss_orders[symbol] not in existing_order_ids:
+                        logger.info(f"Стоп-лосс для {symbol} уже не существует, возможно, сработал")
+                        del self.stop_loss_orders[symbol]
+                        
+                    if symbol in self.take_profit_orders and self.take_profit_orders[symbol] not in existing_order_ids:
+                        logger.info(f"Тейк-профит для {symbol} уже не существует, возможно, сработал")
+                        del self.take_profit_orders[symbol]
+                        
+                    # Если оба ордера исчезли, вероятно, позиция уже закрыта
+                    if (symbol in self.stop_loss_orders or symbol in self.take_profit_orders):
+                        # Продолжаем обычную логику
+                        pass
+                    else:
+                        # Проверяем, действительно ли позиция закрыта
+                        # Используем какой-то метод проверки, например баланс монеты
+                        await self.check_if_position_closed(symbol, current_price)
+                        continue
+                        
                 except Exception as e:
                     logger.warning(f"Ошибка проверки статуса ордеров для {symbol}: {e}")
                 
@@ -1127,7 +1150,7 @@ class EnhancedTradingEngine:
                                 f"Сделок={backtest_results['total_trades']}")
                         self.models[symbol] = (model, scaler, features, threshold, backtest_results, all_features)
                         if backtest_results['win_rate'] < 0.45:
-                            new_threshold = min(threshold + 0.05, 0.65)
+                            new_threshold = min(threshold + 0.02, 0.55)
                             logger.info(f"Адаптация порога для {symbol}: {threshold:.2f} -> {new_threshold:.2f}")
                             self.models[symbol] = (model, scaler, features, new_threshold, backtest_results, all_features)
                         logger.info(f"Модель для {symbol} добавлена")
@@ -1242,20 +1265,85 @@ async def enhanced_trading_loop(trading_engine: EnhancedTradingEngine,
     last_performance_update = datetime.datetime.now()
     last_model_update = datetime.datetime.now()
     last_microstructure_update = datetime.datetime.now()
+    last_balance_check = datetime.datetime.now()
+    initial_balance = get_usdt_balance(client)
+    current_balance = initial_balance
+    balance_history = []
+    
+    logger.warning(f"💰 НАЧАЛЬНЫЙ БАЛАНС: {initial_balance:.2f} USDT 💰")
+    
+    # Сохраняем начальный баланс в trading_engine для доступа из других компонентов
+    trading_engine.initial_balance = initial_balance
+    trading_engine.balance_history = balance_history
+    
     microstructure_data = {}
     try:
         while trading_engine.is_running:
             try:
                 current_time = datetime.datetime.now()
+                
+                # Проверка баланса каждые 2 минуты
+                if (current_time - last_balance_check).total_seconds() > 120:
+                    previous_balance = current_balance
+                    current_balance = get_usdt_balance(client)
+                    
+                    balance_change = current_balance - previous_balance
+                    total_change = current_balance - initial_balance
+                    percent_change = (total_change / initial_balance * 100) if initial_balance > 0 else 0
+                    
+                    if abs(balance_change) > 0.1:  # Если изменение больше 10 центов
+                        change_symbol = "📈" if balance_change > 0 else "📉"
+                        logger.warning(f"{change_symbol} ИЗМЕНЕНИЕ БАЛАНСА: {previous_balance:.2f} → {current_balance:.2f} USDT ({balance_change:.2f} USDT)")
+                        
+                        # Уведомление в Telegram при существенном изменении
+                        if abs(balance_change) > 2.0:  # При изменении больше $2
+                            message = f"{change_symbol} *Изменение баланса*: {balance_change:.2f} USDT\n"
+                            message += f"*Текущий баланс*: {current_balance:.2f} USDT\n"
+                            message += f"*Общее изменение*: {total_change:.2f} USDT ({percent_change:.2f}%)"
+                            
+                            await notification_manager.bot.send_message(
+                                chat_id=notification_manager.chat_id,
+                                text=message,
+                                parse_mode='Markdown'
+                            )
+                    
+                    # Каждые 30 минут выводим полную информацию о балансе
+                    if (current_time - last_balance_check).total_seconds() > 1800:
+                        logger.warning(f"""
+                        ============ СОСТОЯНИЕ БАЛАНСА ============
+                        ТЕКУЩИЙ БАЛАНС: {current_balance:.2f} USDT
+                        НАЧАЛЬНЫЙ БАЛАНС: {initial_balance:.2f} USDT
+                        ИЗМЕНЕНИЕ: {total_change:.2f} USDT ({percent_change:.2f}%)
+                        ===========================================""")
+                    
+                    balance_history.append({
+                        'timestamp': current_time,
+                        'balance': current_balance,
+                        'change': balance_change
+                    })
+                    
+                    # Ограничиваем историю до 1000 записей
+                    if len(balance_history) > 1000:
+                        balance_history = balance_history[-1000:]
+                        
+                    last_balance_check = current_time
+                
+                # Проверка ежедневной статистики
                 if (current_time - trading_engine.monitor.daily_stats['last_reset']).days > 0:
                     await notification_manager.send_daily_report(trading_engine.monitor)
                     trading_engine.monitor.reset_daily_stats()
+                
+                # Переобучение моделей каждые 4 часа
                 if (current_time - last_model_update).total_seconds() > 3600 * 4:
                     logger.info("Переобучение моделей...")
                     await trading_engine.initialize_models()
                     last_model_update = current_time
+                
+                # Обновление корреляций каждый час
                 if (current_time - trading_engine.position_manager.correlation_analyzer.last_update).total_seconds() > 3600:
                     trading_engine.position_manager.correlation_analyzer.update_correlations(client)
+                
+                # Обновление микроструктуры рынка каждые 5 минут
                 if (current_time - last_microstructure_update).total_seconds() > 300:
                     microstructure_data = {}
                     for symbol in SYMBOLS:
@@ -1281,12 +1369,16 @@ async def enhanced_trading_loop(trading_engine: EnhancedTradingEngine,
                         except Exception as e:
                             logger.error(f"Ошибка обновления микроструктуры для {symbol}: {e}")
                     last_microstructure_update = current_time
+                
+                # Обновление трейлинг-стопов для открытых позиций
                 current_prices = {}
                 for symbol in trading_engine.position_manager.positions.keys():
                     price = get_symbol_price(client, symbol)
                     if price:
                         current_prices[symbol] = price
                 await trading_engine.position_manager.update_trailing_stops(current_prices, microstructure_data)
+                
+                # Обработка сигналов для каждого символа
                 tasks = []
                 for symbol in SYMBOLS:
                     if symbol in trading_engine.models:
@@ -1297,22 +1389,57 @@ async def enhanced_trading_loop(trading_engine: EnhancedTradingEngine,
                         tasks.append(task)
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Отправка отчета о производительности каждые 30 минут
                 if (current_time - last_performance_update).total_seconds() > 1800:
                     await notification_manager.send_performance_update(trading_engine.monitor)
                     last_performance_update = current_time
+                
+                # Пауза перед следующей итерацией
                 await asyncio.sleep(UPDATE_INTERVAL_SEC // 2)
+                
             except Exception as e:
                 logger.error(f"Ошибка в торговом цикле: {e}")
                 logger.error(traceback.format_exc())
                 await notification_manager.send_error_notification(f"Ошибка в торговом цикле: {e}")
                 await asyncio.sleep(60)
+                
     except asyncio.CancelledError:
         logger.info("Торговый цикл остановлен")
     finally:
+        # Закрываем все открытые позиции при завершении работы
         for symbol in list(trading_engine.position_manager.positions.keys()):
             price = get_symbol_price(client, symbol)
             if price:
                 await trading_engine.position_manager.close_position(symbol, price, "Shutdown")
+        
+        # Итоговый отчет о балансе
+        final_balance = get_usdt_balance(client)
+        total_change = final_balance - initial_balance
+        percent_change = (total_change / initial_balance * 100) if initial_balance > 0 else 0
+        
+        status_emoji = "📈" if total_change >= 0 else "📉"
+        logger.warning(f"""
+        ============ ИТОГОВЫЙ БАЛАНС ============
+        {status_emoji} НАЧАЛЬНЫЙ БАЛАНС: {initial_balance:.2f} USDT
+        {status_emoji} КОНЕЧНЫЙ БАЛАНС: {final_balance:.2f} USDT
+        {status_emoji} ИЗМЕНЕНИЕ: {total_change:.2f} USDT ({percent_change:.2f}%)
+        =========================================""")
+        
+        try:
+            # Отправка итогового отчета
+            message = f"{status_emoji} *ИТОГОВЫЙ БАЛАНС* {status_emoji}\n\n"
+            message += f"*Начальный баланс*: {initial_balance:.2f} USDT\n"
+            message += f"*Конечный баланс*: {final_balance:.2f} USDT\n"
+            message += f"*Изменение*: {total_change:.2f} USDT ({percent_change:.2f}%)"
+            
+            await notification_manager.bot.send_message(
+                chat_id=notification_manager.chat_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки итогового отчета: {e}")
 
 class EnhancedTelegramHandler:
     def __init__(self, trading_engine: EnhancedTradingEngine, monitor: EnhancedPerformanceMonitor):
